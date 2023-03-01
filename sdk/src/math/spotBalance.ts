@@ -21,6 +21,7 @@ import {
 } from './margin';
 import { OraclePriceData } from '../oracles/types';
 import { PERCENTAGE_PRECISION } from '../constants/numericConstants';
+import { divCeil } from './utils';
 
 export function getBalance(
 	tokenAmount: BN,
@@ -49,11 +50,16 @@ export function getTokenAmount(
 ): BN {
 	const precisionDecrease = TEN.pow(new BN(19 - spotMarket.decimals));
 
-	const cumulativeInterest = isVariant(balanceType, 'deposit')
-		? spotMarket.cumulativeDepositInterest
-		: spotMarket.cumulativeBorrowInterest;
-
-	return balanceAmount.mul(cumulativeInterest).div(precisionDecrease);
+	if (isVariant(balanceType, 'deposit')) {
+		return balanceAmount
+			.mul(spotMarket.cumulativeDepositInterest)
+			.div(precisionDecrease);
+	} else {
+		return divCeil(
+			balanceAmount.mul(spotMarket.cumulativeBorrowInterest),
+			precisionDecrease
+		);
+	}
 }
 
 export function getSignedTokenAmount(
@@ -146,27 +152,27 @@ export function calculateAssetWeight(
 }
 
 export function calculateLiabilityWeight(
-	balanceAmount: BN,
+	size: BN,
 	spotMarket: SpotMarketAccount,
 	marginCategory: MarginCategory
 ): BN {
 	const sizePrecision = TEN.pow(new BN(spotMarket.decimals));
 	let sizeInAmmReservePrecision;
 	if (sizePrecision.gt(AMM_RESERVE_PRECISION)) {
-		sizeInAmmReservePrecision = balanceAmount.div(
+		sizeInAmmReservePrecision = size.div(
 			sizePrecision.div(AMM_RESERVE_PRECISION)
 		);
 	} else {
-		sizeInAmmReservePrecision = balanceAmount
+		sizeInAmmReservePrecision = size
 			.mul(AMM_RESERVE_PRECISION)
 			.div(sizePrecision);
 	}
 
-	let assetWeight;
+	let liabilityWeight;
 
 	switch (marginCategory) {
 		case 'Initial':
-			assetWeight = calculateSizePremiumLiabilityWeight(
+			liabilityWeight = calculateSizePremiumLiabilityWeight(
 				sizeInAmmReservePrecision,
 				new BN(spotMarket.imfFactor),
 				new BN(spotMarket.initialLiabilityWeight),
@@ -174,7 +180,7 @@ export function calculateLiabilityWeight(
 			);
 			break;
 		case 'Maintenance':
-			assetWeight = calculateSizePremiumLiabilityWeight(
+			liabilityWeight = calculateSizePremiumLiabilityWeight(
 				sizeInAmmReservePrecision,
 				new BN(spotMarket.imfFactor),
 				new BN(spotMarket.maintenanceLiabilityWeight),
@@ -182,11 +188,11 @@ export function calculateLiabilityWeight(
 			);
 			break;
 		default:
-			assetWeight = spotMarket.initialLiabilityWeight;
+			liabilityWeight = spotMarket.initialLiabilityWeight;
 			break;
 	}
 
-	return assetWeight;
+	return liabilityWeight;
 }
 
 export function calculateUtilization(bank: SpotMarketAccount): BN {
@@ -331,19 +337,16 @@ export function calculateWithdrawLimit(
 		BN.min(
 			BN.max(
 				marketDepositTokenAmount.div(new BN(6)),
-				borrowTokenTwapLive.add(borrowTokenTwapLive.div(new BN(5)))
+				borrowTokenTwapLive.add(marketDepositTokenAmount.div(new BN(10)))
 			),
 			marketDepositTokenAmount.sub(marketDepositTokenAmount.div(new BN(5)))
 		)
 	); // between ~15-80% utilization with friction on twap
 
 	const minDepositTokens = depositTokenTwapLive.sub(
-		BN.min(
-			BN.max(
-				depositTokenTwapLive.div(new BN(5)),
-				spotMarket.withdrawGuardThreshold
-			),
-			depositTokenTwapLive
+		BN.max(
+			depositTokenTwapLive.div(new BN(5)),
+			BN.min(spotMarket.withdrawGuardThreshold, depositTokenTwapLive)
 		)
 	);
 
@@ -352,7 +355,15 @@ export function calculateWithdrawLimit(
 		ZERO
 	);
 
-	let borrowLimit = BN.max(maxBorrowTokens.sub(marketBorrowTokenAmount), ZERO);
+	let borrowLimit = maxBorrowTokens.sub(marketBorrowTokenAmount);
+	borrowLimit = BN.min(
+		borrowLimit,
+		marketDepositTokenAmount.sub(minDepositTokens)
+	);
+	borrowLimit = BN.min(
+		borrowLimit,
+		marketDepositTokenAmount.sub(marketBorrowTokenAmount)
+	);
 
 	if (borrowLimit.eq(ZERO)) {
 		withdrawLimit = ZERO;

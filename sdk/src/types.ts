@@ -76,6 +76,8 @@ export class DepositDirection {
 
 export class OracleSource {
 	static readonly PYTH = { pyth: {} };
+	static readonly PYTH_1K = { pyth1K: {} };
+	static readonly PYTH_1M = { pyth1M: {} };
 	// static readonly SWITCHBOARD = { switchboard: {} };
 	static readonly QUOTE_ASSET = { quoteAsset: {} };
 }
@@ -222,7 +224,7 @@ export type NewUserRecord = {
 	ts: BN;
 	userAuthority: PublicKey;
 	user: PublicKey;
-	subAccount: number;
+	subAccountId: number;
 	name: number[];
 	referrer: PublicKey;
 };
@@ -846,7 +848,7 @@ export type OrderParams = {
 	price: BN;
 	marketIndex: number;
 	reduceOnly: boolean;
-	postOnly: boolean;
+	postOnly: PostOnlyParams;
 	immediateOrCancel: boolean;
 	triggerPrice: BN | null;
 	triggerCondition: OrderTriggerCondition;
@@ -857,6 +859,12 @@ export type OrderParams = {
 	auctionStartPrice: BN | null;
 	auctionEndPrice: BN | null;
 };
+
+export class PostOnlyParams {
+	static readonly NONE = { none: {} };
+	static readonly MUST_POST_ONLY = { mustPostOnly: {} }; // Tx fails if order can't be post only
+	static readonly TRY_POST_ONLY = { tryPostOnly: {} }; // Tx succeeds and order not placed if can't be post only
+}
 
 export type NecessaryOrderParams = {
 	orderType: OrderType;
@@ -878,7 +886,7 @@ export const DefaultOrderParams: OrderParams = {
 	price: ZERO,
 	marketIndex: 0,
 	reduceOnly: false,
-	postOnly: false,
+	postOnly: PostOnlyParams.NONE,
 	immediateOrCancel: false,
 	triggerPrice: null,
 	triggerCondition: OrderTriggerCondition.ABOVE,

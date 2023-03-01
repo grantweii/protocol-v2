@@ -57,9 +57,8 @@ pub fn calculate_size_premium_liability_weight(
 
     let imf_factor_u128 = imf_factor.cast::<u128>()?;
     let liability_weight_u128 = liability_weight.cast::<u128>()?;
-    let liability_weight_numerator = liability_weight_u128.safe_sub(
-        liability_weight_u128.safe_div(max(1, SPOT_IMF_PRECISION_U128 / imf_factor_u128))?,
-    )?;
+    let liability_weight_numerator =
+        liability_weight_u128.safe_sub(liability_weight_u128.safe_div(5)?)?;
 
     // increases
     let size_premium_liability_weight = liability_weight_numerator
@@ -241,6 +240,33 @@ pub fn calculate_perp_position_value_and_pnl(
     ))
 }
 
+pub fn calculate_user_safest_position_tiers(
+    user: &User,
+    perp_market_map: &PerpMarketMap,
+    spot_market_map: &SpotMarketMap,
+) -> DriftResult<(AssetTier, ContractTier)> {
+    let mut safest_tier_spot_liablity: AssetTier = AssetTier::default();
+    let mut safest_tier_perp_liablity: ContractTier = ContractTier::default();
+
+    for spot_position in user.spot_positions.iter() {
+        if spot_position.is_available() || spot_position.balance_type == SpotBalanceType::Deposit {
+            continue;
+        }
+        let spot_market = spot_market_map.get_ref(&spot_position.market_index)?;
+        safest_tier_spot_liablity = min(safest_tier_spot_liablity, spot_market.asset_tier);
+    }
+
+    for market_position in user.perp_positions.iter() {
+        if market_position.is_available() {
+            continue;
+        }
+        let market = &perp_market_map.get_ref(&market_position.market_index)?;
+        safest_tier_perp_liablity = min(safest_tier_perp_liablity, market.contract_tier);
+    }
+
+    Ok((safest_tier_spot_liablity, safest_tier_perp_liablity))
+}
+
 pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
     user: &User,
     perp_market_map: &PerpMarketMap,
@@ -267,7 +293,7 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
     for spot_position in user.spot_positions.iter() {
         validation::position::validate_spot_position(spot_position)?;
 
-        if spot_position.scaled_balance == 0 && spot_position.open_orders == 0 {
+        if spot_position.is_available() {
             continue;
         }
 
@@ -318,7 +344,6 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
                     )?;
 
                     margin_requirement = margin_requirement.safe_add(weighted_token_value)?;
-
                     num_spot_liabilities += 1;
 
                     if let Some(margin_buffer_ratio) = margin_buffer_ratio {
@@ -480,11 +505,7 @@ pub fn calculate_margin_requirement_and_total_collateral_and_liability_info(
     }
 
     for market_position in user.perp_positions.iter() {
-        if market_position.base_asset_amount == 0
-            && market_position.quote_asset_amount == 0
-            && !market_position.has_open_order()
-            && !market_position.is_lp()
-        {
+        if market_position.is_available() {
             continue;
         }
 
