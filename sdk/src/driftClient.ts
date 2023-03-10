@@ -25,9 +25,12 @@ import {
 	TxParams,
 	SerumV3FulfillmentConfigAccount,
 	isVariant,
+	ReferrerNameAccount,
 	OrderTriggerCondition,
 	isOneOfVariant,
 	PostOnlyParams,
+	SpotBalanceType,
+	PerpMarketExtendedInfo,
 } from './types';
 import * as anchor from '@project-serum/anchor';
 import driftIDL from './idl/drift.json';
@@ -56,6 +59,7 @@ import {
 	getDriftStateAccountPublicKey,
 	getInsuranceFundStakeAccountPublicKey,
 	getPerpMarketPublicKey,
+	getReferrerNamePublicKeySync,
 	getSerumFulfillmentConfigPublicKey,
 	getSerumSignerPublicKey,
 	getSpotMarketPublicKey,
@@ -85,6 +89,7 @@ import { configs, getMarketsAndOraclesForSubscription } from './config';
 import { WRAPPED_SOL_MINT } from './constants/spotMarkets';
 import { UserStats } from './userStats';
 import { isSpotPositionAvailable } from './math/spotPosition';
+import { calculateMarketMaxAvailableInsurance } from './math/market';
 
 type RemainingAccountParams = {
 	userAccounts: UserAccount[];
@@ -581,6 +586,40 @@ export class DriftClient {
 		});
 	}
 
+	public async initializeReferrerName(
+		name: string
+	): Promise<TransactionSignature> {
+		const userAccountPublicKey = getUserAccountPublicKeySync(
+			this.program.programId,
+			this.wallet.publicKey,
+			0
+		);
+
+		const nameBuffer = encodeName(name);
+
+		const referrerNameAccountPublicKey = await getReferrerNamePublicKeySync(
+			this.program.programId,
+			nameBuffer
+		);
+
+		const tx = await this.program.transaction.initializeReferrerName(
+			nameBuffer,
+			{
+				accounts: {
+					referrerName: referrerNameAccountPublicKey,
+					user: userAccountPublicKey,
+					authority: this.wallet.publicKey,
+					userStats: this.getUserStatsAccountPublicKey(),
+					payer: this.wallet.publicKey,
+					rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+					systemProgram: anchor.web3.SystemProgram.programId,
+				},
+			}
+		);
+		const { txSig } = await this.sendTransaction(tx, [], this.opts);
+		return txSig;
+	}
+
 	public async updateUserName(
 		name: string,
 		subAccountId = 0
@@ -755,6 +794,19 @@ export class DriftClient {
 
 	public getUserStats(): UserStats {
 		return this.userStats;
+	}
+
+	public async fetchReferrerNameAccount(
+		name: string
+	): Promise<ReferrerNameAccount | undefined> {
+		const nameBuffer = encodeName(name);
+		const referrerNameAccountPublicKey = getReferrerNamePublicKeySync(
+			this.program.programId,
+			nameBuffer
+		);
+		return (await this.program.account.referrerName.fetch(
+			referrerNameAccountPublicKey
+		)) as ReferrerNameAccount;
 	}
 
 	userStatsAccountPublicKey: PublicKey;
@@ -2214,7 +2266,7 @@ export class DriftClient {
 		userAccountPublicKey: PublicKey,
 		user: UserAccount,
 		order?: Pick<Order, 'marketIndex' | 'orderId'>,
-		makerInfo?: MakerInfo,
+		makerInfo?: MakerInfo | MakerInfo[],
 		referrerInfo?: ReferrerInfo,
 		txParams?: TxParams
 	): Promise<TransactionSignature> {
@@ -2240,7 +2292,7 @@ export class DriftClient {
 		userAccountPublicKey: PublicKey,
 		userAccount: UserAccount,
 		order: Pick<Order, 'marketIndex' | 'orderId'>,
-		makerInfo?: MakerInfo,
+		makerInfo?: MakerInfo | MakerInfo[],
 		referrerInfo?: ReferrerInfo
 	): Promise<TransactionInstruction> {
 		const userStatsPublicKey = getUserStatsAccountPublicKey(
@@ -2257,45 +2309,54 @@ export class DriftClient {
 					(order) => order.orderId === userAccount.nextOrderId - 1
 			  ).marketIndex;
 
+		makerInfo = Array.isArray(makerInfo)
+			? makerInfo
+			: makerInfo
+			? [makerInfo]
+			: [];
+
 		const userAccounts = [userAccount];
-		if (makerInfo !== undefined) {
-			userAccounts.push(makerInfo.makerUserAccount);
+		for (const maker of makerInfo) {
+			userAccounts.push(maker.makerUserAccount);
 		}
 		const remainingAccounts = this.getRemainingAccounts({
 			userAccounts,
 			writablePerpMarketIndexes: [marketIndex],
 		});
 
-		if (makerInfo) {
+		for (const maker of makerInfo) {
 			remainingAccounts.push({
-				pubkey: makerInfo.maker,
+				pubkey: maker.maker,
 				isWritable: true,
 				isSigner: false,
 			});
 			remainingAccounts.push({
-				pubkey: makerInfo.makerStats,
+				pubkey: maker.makerStats,
 				isWritable: true,
 				isSigner: false,
 			});
 		}
 
 		if (referrerInfo) {
-			remainingAccounts.push({
-				pubkey: referrerInfo.referrer,
-				isWritable: true,
-				isSigner: false,
-			});
-			remainingAccounts.push({
-				pubkey: referrerInfo.referrerStats,
-				isWritable: true,
-				isSigner: false,
-			});
+			const referrerIsMaker =
+				makerInfo.find((maker) => maker.maker.equals(referrerInfo.referrer)) !==
+				undefined;
+			if (!referrerIsMaker) {
+				remainingAccounts.push({
+					pubkey: referrerInfo.referrer,
+					isWritable: true,
+					isSigner: false,
+				});
+				remainingAccounts.push({
+					pubkey: referrerInfo.referrerStats,
+					isWritable: true,
+					isSigner: false,
+				});
+			}
 		}
 
 		const orderId = order.orderId;
-		const makerOrderId = makerInfo ? makerInfo.order.orderId : null;
-
-		return await this.program.instruction.fillPerpOrder(orderId, makerOrderId, {
+		return await this.program.instruction.fillPerpOrder(orderId, null, {
 			accounts: {
 				state: await this.getStatePublicKey(),
 				filler: fillerPublicKey,
@@ -2675,7 +2736,7 @@ export class DriftClient {
 
 	public async placeAndTakePerpOrder(
 		orderParams: OptionalOrderParams,
-		makerInfo?: MakerInfo,
+		makerInfo?: MakerInfo | MakerInfo[],
 		referrerInfo?: ReferrerInfo,
 		txParams?: TxParams
 	): Promise<TransactionSignature> {
@@ -2698,54 +2759,64 @@ export class DriftClient {
 
 	public async getPlaceAndTakePerpOrderIx(
 		orderParams: OptionalOrderParams,
-		makerInfo?: MakerInfo,
+		makerInfo?: MakerInfo | MakerInfo[],
 		referrerInfo?: ReferrerInfo
 	): Promise<TransactionInstruction> {
 		orderParams = this.getOrderParams(orderParams, MarketType.PERP);
 		const userStatsPublicKey = await this.getUserStatsAccountPublicKey();
 		const userAccountPublicKey = await this.getUserAccountPublicKey();
 
+		makerInfo = Array.isArray(makerInfo)
+			? makerInfo
+			: makerInfo
+			? [makerInfo]
+			: [];
+
 		const userAccounts = [this.getUserAccount()];
-		if (makerInfo !== undefined) {
-			userAccounts.push(makerInfo.makerUserAccount);
+		for (const maker of makerInfo) {
+			userAccounts.push(maker.makerUserAccount);
 		}
+
 		const remainingAccounts = this.getRemainingAccounts({
 			userAccounts,
 			useMarketLastSlotCache: true,
 			writablePerpMarketIndexes: [orderParams.marketIndex],
 		});
 
-		let makerOrderId = null;
-		if (makerInfo) {
-			makerOrderId = makerInfo.order.orderId;
+		for (const maker of makerInfo) {
 			remainingAccounts.push({
-				pubkey: makerInfo.maker,
-				isSigner: false,
+				pubkey: maker.maker,
 				isWritable: true,
+				isSigner: false,
 			});
 			remainingAccounts.push({
-				pubkey: makerInfo.makerStats,
-				isSigner: false,
+				pubkey: maker.makerStats,
 				isWritable: true,
+				isSigner: false,
 			});
 		}
 
 		if (referrerInfo) {
-			remainingAccounts.push({
-				pubkey: referrerInfo.referrer,
-				isWritable: true,
-				isSigner: false,
-			});
-			remainingAccounts.push({
-				pubkey: referrerInfo.referrerStats,
-				isWritable: true,
-				isSigner: false,
-			});
+			const referrerIsMaker =
+				makerInfo.find((maker) => maker.maker.equals(referrerInfo.referrer)) !==
+				undefined;
+			if (!referrerIsMaker) {
+				remainingAccounts.push({
+					pubkey: referrerInfo.referrer,
+					isWritable: true,
+					isSigner: false,
+				});
+				remainingAccounts.push({
+					pubkey: referrerInfo.referrerStats,
+					isWritable: true,
+					isSigner: false,
+				});
+			}
 		}
 
 		return await this.program.instruction.placeAndTakePerpOrder(
 			orderParams,
-			makerOrderId,
+			null,
 			{
 				accounts: {
 					state: await this.getStatePublicKey(),
@@ -4144,6 +4215,31 @@ export class DriftClient {
 				remainingAccounts: remainingAccounts,
 			}
 		);
+	}
+
+	public getPerpMarketExtendedInfo(
+		marketIndex: number
+	): PerpMarketExtendedInfo {
+		const marketAccount = this.getPerpMarketAccount(marketIndex);
+		const quoteAccount = this.getSpotMarketAccount(QUOTE_SPOT_MARKET_INDEX);
+
+		const extendedInfo: PerpMarketExtendedInfo = {
+			marketIndex,
+			minOrderSize: marketAccount.amm?.minOrderSize,
+			marginMaintenance: marketAccount.marginRatioMaintenance,
+			pnlPoolValue: getTokenAmount(
+				marketAccount.pnlPool?.scaledBalance,
+				quoteAccount,
+				SpotBalanceType.DEPOSIT
+			),
+			contractTier: marketAccount.contractTier,
+			availableInsurance: calculateMarketMaxAvailableInsurance(
+				marketAccount,
+				quoteAccount
+			),
+		};
+
+		return extendedInfo;
 	}
 
 	sendTransaction(
