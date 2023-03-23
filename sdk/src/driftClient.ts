@@ -1,4 +1,10 @@
-import { AnchorProvider, BN, Idl, Program } from '@project-serum/anchor';
+import {
+	AnchorProvider,
+	BN,
+	Idl,
+	Program,
+	ProgramAccount,
+} from '@project-serum/anchor';
 import bs58 from 'bs58';
 import {
 	ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -473,7 +479,7 @@ export class DriftClient {
 		this.userStatsAccountPublicKey = undefined;
 	}
 
-	public async switchActiveUser(subAccountId: number): Promise<void> {
+	public switchActiveUser(subAccountId: number) {
 		this.activeSubAccountId = subAccountId;
 	}
 
@@ -597,7 +603,7 @@ export class DriftClient {
 
 		const nameBuffer = encodeName(name);
 
-		const referrerNameAccountPublicKey = await getReferrerNamePublicKeySync(
+		const referrerNameAccountPublicKey = getReferrerNamePublicKeySync(
 			this.program.programId,
 			nameBuffer
 		);
@@ -713,6 +719,25 @@ export class DriftClient {
 		return txSig;
 	}
 
+	public async fetchAllUserAccounts(
+		includeIdle = true
+	): Promise<ProgramAccount<UserAccount>[]> {
+		let filters = undefined;
+		if (!includeIdle) {
+			filters = [
+				{
+					memcmp: {
+						offset: 4350,
+						bytes: bs58.encode(Uint8Array.from([0])),
+					},
+				},
+			];
+		}
+		return (await this.program.account.user.all(
+			filters
+		)) as ProgramAccount<UserAccount>[];
+	}
+
 	public async getUserAccountsForDelegate(
 		delegate: PublicKey
 	): Promise<UserAccount[]> {
@@ -746,6 +771,24 @@ export class DriftClient {
 
 		return programAccounts.map(
 			(programAccount) => programAccount.account as UserAccount
+		);
+	}
+
+	public async getReferrerNameAccountsForAuthority(
+		authority: PublicKey
+	): Promise<ReferrerNameAccount[]> {
+		const programAccounts = await this.program.account.referrerName.all([
+			{
+				memcmp: {
+					offset: 8,
+					/** data to match, as base-58 encoded string and limited to less than 129 bytes */
+					bytes: bs58.encode(authority.toBuffer()),
+				},
+			},
+		]);
+
+		return programAccounts.map(
+			(programAccount) => programAccount.account as ReferrerNameAccount
 		);
 	}
 
@@ -1304,7 +1347,8 @@ export class DriftClient {
 		subAccountId = 0,
 		name = DEFAULT_USER_NAME,
 		fromSubAccountId?: number,
-		referrerInfo?: ReferrerInfo
+		referrerInfo?: ReferrerInfo,
+		txParams?: TxParams
 	): Promise<[TransactionSignature, PublicKey]> {
 		const [userAccountPublicKey, initializeUserAccountIx] =
 			await this.getInitializeUserInstructions(
@@ -1320,6 +1364,20 @@ export class DriftClient {
 		const isSolMarket = spotMarket.mint.equals(WRAPPED_SOL_MINT);
 
 		const tx = new Transaction();
+
+		tx.add(
+			ComputeBudgetProgram.setComputeUnitLimit({
+				units: txParams?.computeUnits ?? 600_000,
+			})
+		);
+
+		if (txParams?.computeUnitsPrice) {
+			tx.add(
+				ComputeBudgetProgram.setComputeUnitPrice({
+					microLamports: txParams.computeUnitsPrice,
+				})
+			);
+		}
 
 		const authority = this.wallet.publicKey;
 
@@ -1888,14 +1946,18 @@ export class DriftClient {
 	 * @param userAccountPublicKey
 	 * @param userAccount
 	 * @param makerInfo
+	 * @param txParams
+	 * @param bracketOrdersParams
 	 * @returns
 	 */
 	public async sendMarketOrderAndGetSignedFillTx(
 		orderParams: OptionalOrderParams,
 		userAccountPublicKey: PublicKey,
 		userAccount: UserAccount,
-		makerInfo?: MakerInfo,
-		txParams?: TxParams
+		makerInfo?: MakerInfo | MakerInfo[],
+		txParams?: TxParams,
+		bracketOrdersParams = new Array<OptionalOrderParams>(),
+		referrerInfo?: ReferrerInfo
 	): Promise<{ txSig: TransactionSignature; signedFillTx: Transaction }> {
 		const marketIndex = orderParams.marketIndex;
 		const orderId = userAccount.nextOrderId;
@@ -1905,6 +1967,10 @@ export class DriftClient {
 			txParams?.computeUnits,
 			txParams?.computeUnitsPrice
 		);
+		for (const bracketOrderParams of bracketOrdersParams) {
+			marketOrderTx.add(await this.getPlacePerpOrderIx(bracketOrderParams));
+		}
+
 		const fillTx = wrapInTx(
 			await this.getFillPerpOrderIx(
 				userAccountPublicKey,
@@ -1913,7 +1979,8 @@ export class DriftClient {
 					orderId,
 					marketIndex,
 				},
-				makerInfo
+				makerInfo,
+				referrerInfo
 			),
 			txParams?.computeUnits,
 			txParams?.computeUnitsPrice
@@ -2369,6 +2436,20 @@ export class DriftClient {
 		});
 	}
 
+	public async getRevertFillIx(): Promise<TransactionInstruction> {
+		const fillerPublicKey = await this.getUserAccountPublicKey();
+		const fillerStatsPublicKey = this.getUserStatsAccountPublicKey();
+
+		return this.program.instruction.revertFill({
+			accounts: {
+				state: await this.getStatePublicKey(),
+				filler: fillerPublicKey,
+				fillerStats: fillerStatsPublicKey,
+				authority: this.wallet.publicKey,
+			},
+		});
+	}
+
 	public async placeSpotOrder(
 		orderParams: OptionalOrderParams,
 		txParams?: TxParams
@@ -2724,6 +2805,44 @@ export class DriftClient {
 		});
 
 		return await this.program.instruction.forceCancelOrders({
+			accounts: {
+				state: await this.getStatePublicKey(),
+				filler: fillerPublicKey,
+				user: userAccountPublicKey,
+				authority: this.wallet.publicKey,
+			},
+			remainingAccounts,
+		});
+	}
+
+	public async updateUserIdle(
+		userAccountPublicKey: PublicKey,
+		user: UserAccount,
+		txParams?: TxParams
+	): Promise<TransactionSignature> {
+		const { txSig } = await this.txSender.send(
+			wrapInTx(
+				await this.getUpdateUserIdleIx(userAccountPublicKey, user),
+				txParams?.computeUnits,
+				txParams?.computeUnitsPrice
+			),
+			[],
+			this.opts
+		);
+		return txSig;
+	}
+
+	public async getUpdateUserIdleIx(
+		userAccountPublicKey: PublicKey,
+		userAccount: UserAccount
+	): Promise<TransactionInstruction> {
+		const fillerPublicKey = await this.getUserAccountPublicKey();
+
+		const remainingAccounts = this.getRemainingAccounts({
+			userAccounts: [userAccount],
+		});
+
+		return await this.program.instruction.updateUserIdle({
 			accounts: {
 				state: await this.getStatePublicKey(),
 				filler: fillerPublicKey,
@@ -3377,17 +3496,19 @@ export class DriftClient {
 			settleeUserAccountPublicKey: PublicKey;
 			settleeUserAccount: UserAccount;
 		}[],
-		marketIndex: number
+		marketIndexes: number[]
 	): Promise<TransactionSignature> {
 		const ixs = [];
 		for (const { settleeUserAccountPublicKey, settleeUserAccount } of users) {
-			ixs.push(
-				await this.settlePNLIx(
-					settleeUserAccountPublicKey,
-					settleeUserAccount,
-					marketIndex
-				)
-			);
+			for (const marketIndex of marketIndexes) {
+				ixs.push(
+					await this.settlePNLIx(
+						settleeUserAccountPublicKey,
+						settleeUserAccount,
+						marketIndex
+					)
+				);
+			}
 		}
 
 		const tx = new Transaction()
